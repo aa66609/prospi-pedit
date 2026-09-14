@@ -18,6 +18,9 @@ const TH32CS_SNAPPROCESS: u32 = 0x2;
 const TH32CS_SNAPMODULE: u32 = 0x8;
 const TH32CS_SNAPMODULE32: u32 = 0x10;
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_RELEASE: u32 = 0x8000;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PROCESS_QUERY_INFORMATION: u32 = 0x400;
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_VM_WRITE: u32 = 0x20;
@@ -75,6 +78,8 @@ extern "system" {
     fn CloseHandle(h: HANDLE) -> BOOL;
     fn VirtualQueryEx(h: HANDLE, a: *const c_void, b: *mut MEMORY_BASIC_INFORMATION,
                       l: usize) -> usize;
+    fn VirtualAllocEx(h: HANDLE, a: *mut c_void, s: usize, typ: u32, protect: u32) -> *mut c_void;
+    fn VirtualFreeEx(h: HANDLE, a: *mut c_void, s: usize, typ: u32) -> BOOL;
     fn ReadProcessMemory(h: HANDLE, a: *const c_void, b: *mut c_void, s: usize,
                          r: *mut usize) -> BOOL;
     fn WriteProcessMemory(h: HANDLE, a: *mut c_void, b: *const c_void, s: usize,
@@ -521,11 +526,11 @@ pub const OFF_PERSONALITY: usize = 0xE81;
 pub const OFF_MOOD: usize = 0xE82;
 /// 栄冠球員體力（u16 little-endian，0..=0x01F4 / 0..=500）
 pub const OFF_ENERGY: usize = 0xE86;
-/// 栄冠球員學力實際值；畫面 Rank 依區間 E/D/C/B/A 顯示
-/// ⚠ **不要寫這裡，也不要當成學力。** 2026-08-29 實測：
-/// 寫 0、6、30、100、117、200、255 全部試過，畫面一律停在 E ——
-/// 這個 offset 對顯示沒有任何作用。真正的來源還沒找到。
-/// （實際值域 26~117 且隨年級遞增，看起來確實是某種累積點數，但不是畫面在讀的那個。）
+/// 栄冠球員學力實際值（u8）。
+/// 2026-08-30 重新以正確 Player Object 做差分與因果驗證，確認 +0xE88 會直接影響學力顯示。
+/// 已實測 Rank 區間：E=0x00..0x23、D=0x24..0x2D、C=0x2E..0x37、
+/// B=0x38..0x41、A=0x42..0x4B。
+/// ⚠ 先前判定「+0xE88 無效」是因為測到錯誤的球員 / Player Object；目前恢復為可寫欄位。
 pub const OFF_ACADEMIC: usize = 0xE88;
 /// 栄冠球員招募評價（u16 little-endian，0..=0x01FF / 0..=511）
 pub const OFF_RECRUIT_EVAL: usize = 0xE8C;
@@ -825,6 +830,8 @@ pub struct Player {
     pub speed: u16,
     pub stamina: u16,
     pub pack_hi: u16,
+    /// Overall 計算使用的三個投手 packed 3-bit 欄位（P+28 DWORD bits22..30）。
+    pub pitch_traits: [u8; 3],
     pub grade: u8,
     /// 栄冠球員信賴度（0..=200）
     pub trust: u8,
@@ -931,6 +938,9 @@ impl Player {
         let u8a = |o: usize| b[o];
         let u16a = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
         let pack = u16::from_le_bytes([b[OFF_PACK], b[OFF_PACK + 1]]);
+        // 遊戲 Overall 計算器是從 P+28 起讀一個 DWORD：
+        // bits 8..14=球速 raw、15..21=耐力、22..24/25..27/28..30=三個投手 3-bit 欄位。
+        let pitcher_raw = u32::from_le_bytes([b[OFF_DEF], b[OFF_PACK], b[OFF_PACK + 1], b[OFF_PACK + 2]]);
         let mut pl = Player {
             addr: obj,
             name: name_from(b),
@@ -947,6 +957,11 @@ impl Player {
             speed: (pack & 0x7F) + 80,
             stamina: (pack >> 7) & 0x7F,
             pack_hi: pack & 0xC000,
+            pitch_traits: [
+                ((pitcher_raw >> 22) & 7) as u8,
+                ((pitcher_raw >> 25) & 7) as u8,
+                ((pitcher_raw >> 28) & 7) as u8,
+            ],
             grade: u8a(OFF_GRADE),
             trust: u8a(OFF_TRUST),
             personality: u8a(OFF_PERSONALITY),
@@ -986,6 +1001,306 @@ impl Player {
     /// 找出某個球種 slot 對應的原創球種記錄
     pub fn rec_for_slot(&self, slot: usize) -> Option<&OrigRec> {
         self.recs.iter().find(|r| r.slot == slot as u32)
+    }
+
+    /// 依目前已逆向出的遊戲公式，在修改器端直接計算總評（0..=999）。
+    ///
+    /// 這是不呼叫遊戲函式、不 hook / patch 的純本地計算。等同目前已確認的
+    /// `calc_player_overall(..., modifier=null, param_3=0)` 路徑。
+    ///
+    /// 尚待更多實機樣本驗證的只有極少數特殊球種/模式修正；一般 roster 顯示可先用它對照。
+    pub fn overall(&self) -> i32 {
+        fn rating(v: i32) -> i32 {
+            if v > 89 { ((v - 90) * 20) / 10 + 101 }
+            else if v > 79 { ((v - 80) * 18) / 10 + 83 }
+            else if v > 69 { ((v - 70) * 16) / 10 + 67 }
+            else if v > 59 { ((v - 60) * 14) / 10 + 53 }
+            else if v > 49 { ((v - 50) * 12) / 10 + 41 }
+            else if v > 39 { ((v - 40) * 11) / 10 + 30 }
+            else if v > 19 { v - 10 }
+            else { v / 2 }
+        }
+
+        fn speed_rating(v: i32) -> i32 {
+            if v > 169 { ((v - 170) * 24) / 5 + 151 }
+            else if v > 164 { ((v - 165) * 22) / 5 + 129 }
+            else if v > 159 { ((v - 160) * 20) / 5 + 109 }
+            else if v > 154 { ((v - 155) * 18) / 5 + 91 }
+            else if v > 149 { ((v - 150) * 16) / 5 + 75 }
+            else if v > 144 { ((v - 145) * 15) / 5 + 60 }
+            else if v > 139 { ((v - 140) * 14) / 5 + 46 }
+            else if v > 134 { ((v - 135) * 13) / 5 + 33 }
+            else if v > 129 { ((v - 130) * 12) / 5 + 21 }
+            else if v > 124 { ((v - 125) * 11) / 5 + 10 }
+            else { (v * 2 - 240).max(0) }
+        }
+
+        fn trait_rating(v: u8) -> i32 {
+            match v {
+                1 | 2 => 1,
+                3..=6 => 2,
+                7 => 4,
+                _ => 0,
+            }
+        }
+
+        fn signed_bits(v: u8, shift: u8, bits: u8) -> i32 {
+            let mask = (1u16 << bits) - 1;
+            let x = ((v as u16 >> shift) & mask) as i32;
+            let sign = 1i32 << (bits - 1);
+            if x & sign != 0 { x - (1i32 << bits) } else { x }
+        }
+
+        fn special_value(a: &[u8; ABIL_BYTES], id: usize) -> i32 {
+            match id {
+                0x00 => ((a[0x0d] >> 6) & 1) as i32,
+                0x01 => signed_bits(a[0x0b], 4, 2),
+                0x02 => signed_bits(a[0x05], 0, 3),
+                0x03 => ((a[0] >> 3) & 1) as i32,
+                0x04 => (a[0] >> 7) as i32,
+                0x05 => ((a[5] >> 4) & 3) as i32,
+                0x06 => ((a[1] >> 3) & 1) as i32,
+                0x07 => signed_bits(a[0], 0, 3),
+                0x08 => signed_bits(a[0], 4, 3),
+                0x09 => (a[1] >> 7) as i32,
+                0x0a => ((a[2] >> 3) & 1) as i32,
+                0x0b => (a[2] >> 7) as i32,
+                0x0c => ((a[3] >> 3) & 1) as i32,
+                0x0d => signed_bits(a[5], 6, 2),
+                0x0e => (a[3] >> 7) as i32,
+                0x0f => (a[6] & 3) as i32,
+                0x10 => ((a[4] >> 3) & 1) as i32,
+                0x11 => (a[4] >> 7) as i32,
+                0x12 => signed_bits(a[6], 2, 2),
+                0x13 => ((a[5] >> 3) & 1) as i32,
+                0x14 => ((a[0x0b] >> 6) & 1) as i32,
+                0x15 => signed_bits(a[6], 4, 2),
+                0x16 => (a[0x0b] >> 7) as i32,
+                0x17 => (a[0x0c] & 1) as i32,
+                0x18 => (a[6] >> 6) as i32,
+                0x19 => signed_bits(a[7], 6, 2),
+                0x1a => ((a[0x0c] >> 3) & 1) as i32,
+                0x1b => signed_bits(a[8], 0, 2),
+                0x1c => signed_bits(a[8], 2, 2),
+                0x1d => ((a[0x0c] >> 4) & 1) as i32,
+                0x1e => ((a[8] >> 4) & 3) as i32,
+                0x1f => ((a[0x0c] >> 5) & 1) as i32,
+                0x20 => (a[8] >> 6) as i32,
+                0x21 => signed_bits(a[1], 0, 3),
+                0x22 => signed_bits(a[9], 0, 2),
+                0x23 => signed_bits(a[1], 4, 3),
+                0x24 => signed_bits(a[9], 2, 2),
+                0x25 => signed_bits(a[2], 0, 3),
+                0x26 => signed_bits(a[2], 4, 3),
+                0x27 => signed_bits(a[9], 4, 2),
+                0x28 => signed_bits(a[9], 6, 2),
+                0x29 => ((a[0x0c] >> 6) & 1) as i32,
+                0x2a => signed_bits(a[10], 0, 2),
+                0x2b => (a[0x0c] >> 7) as i32,
+                0x2c => signed_bits(a[10], 2, 2),
+                0x2d => signed_bits(a[10], 4, 2),
+                0x2e => signed_bits(a[10], 6, 2),
+                0x2f => signed_bits(a[0x0b], 0, 2),
+                0x30 => (a[0x0d] & 1) as i32,
+                0x31 => ((a[0x0d] >> 1) & 1) as i32,
+                0x32 => signed_bits(a[3], 0, 3),
+                0x33 => signed_bits(a[3], 4, 3),
+                0x34 => ((a[0x0d] >> 2) & 1) as i32,
+                0x35 => ((a[0x0d] >> 3) & 1) as i32,
+                0x36 => signed_bits(a[0x0b], 2, 2),
+                0x37 => signed_bits(a[4], 0, 3),
+                0x38 => signed_bits(a[4], 4, 3),
+                0x39 => ((a[0x0d] >> 4) & 1) as i32,
+                0x3a => ((a[0x0d] >> 5) & 1) as i32,
+                0x3b => signed_bits(a[7], 0, 2),
+                0x3c => ((a[0x0c] >> 1) & 1) as i32,
+                0x3d => signed_bits(a[7], 2, 2),
+                0x3e => ((a[7] >> 4) & 3) as i32,
+                0x3f => ((a[0x0c] >> 2) & 1) as i32,
+                0x40 => (a[0x0d] >> 7) as i32,
+                _ => 0,
+            }
+        }
+
+        fn special_raw(id: usize, v: i32) -> i32 {
+            if v == 0 { return 0; }
+            match id {
+                0x00 | 0x01 | 0x0e | 0x1b | 0x31 | 0x34 | 0x39 | 0x3a | 0x3c => 10,
+                0x02 | 0x26 => v * 15,
+                0x03 | 0x1a | 0x1d | 0x21 | 0x23 | 0x30 | 0x3f => 50,
+                0x04 => 20,
+                0x05 => match v { 1 => 25, 2 => 50, _ => 0 },
+                0x06 | 0x40 => 60,
+                0x07 | 0x18 | 0x28 | 0x2e | 0x32 | 0x33 | 0x36 | 0x37 | 0x3e => v * 25,
+                0x08 | 0x25 | 0x38 | 0x3b => v * 30,
+                0x09 | 0x0b | 0x0c | 0x0d | 0x10 | 0x11 | 0x17 | 0x1f | 0x29 | 0x35 => 25,
+                0x0a | 0x13 | 0x14 | 0x16 | 0x2b => 15,
+                0x0f | 0x1e => match v { 1 => 40, 2 => 100, _ => 0 },
+                0x12 => match v { -1 => 40, 1 => 100, _ => 0 },
+                0x15 | 0x22 => match v { -1 => -30, 1 => 25, _ => 0 },
+                0x19 | 0x24 | 0x2a | 0x2c | 0x2d => -25,
+                0x1c => v * 50,
+                0x20 | 0x3d => v * 10,
+                0x27 => match v { -1 => 20, 1 => 60, _ => 0 },
+                0x2f => -40,
+                _ => 0,
+            }
+        }
+
+        fn special_quarter(id: usize, a: &[u8; ABIL_BYTES]) -> i32 {
+            let raw = special_raw(id, special_value(a, id));
+            if raw == 0 { 0 } else {
+                let q = raw / 4; // Rust i32 跟 C 一樣向 0 截斷
+                if q == 0 { if raw >= 0 { 1 } else { -1 } } else { q }
+            }
+        }
+
+        fn pitch_power_rating(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 3, 3 => 6, 4 => 15, 5 => 30, 6 => 60, 7 => 90, _ => 0,
+            }
+        }
+        fn pitch_move_bonus(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 3, 3 => 5, 4 => 12, 5 => 18, 6 => 25, 7 => 32, _ => 0,
+            }
+        }
+        fn pitch_control_bonus(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 2, 3 => 4, 4 => 6, 5 => 9, 6 => 12, 7 => 18, _ => 0,
+            }
+        }
+
+        let stat = |i: usize| self.stats[i].min(99) as i32;
+        let pos_rating = |p: usize| -> i32 {
+            if p == 0 {
+                if self.pos == 0 { self.defense as i32 } else { 0 }
+            } else {
+                self.field.get(p - 1).copied().unwrap_or(0) as i32
+            }
+        };
+
+        // calc_player_overall 的共通部分：疲勞消除 40% + 特定共通特殊能力。
+        let mut common = rating(stat(7)) * 40 / 100;
+        for id in [0usize, 1, 2, 0x3d] {
+            common += special_quarter(id, &self.abil);
+        }
+
+        // calc_fielder_component (FUN_145ABE560)
+        let cr = rating(stat(0));
+        let cl = rating(stat(1));
+        let power = rating(stat(2));
+        let speed = rating(stat(3));
+        let arm = rating(stat(4));
+        let throw_ = rating(stat(5));
+        let catch = rating(stat(6));
+
+        let mut field_sum = 0;
+        for p in 1..=8usize {
+            let mut x = rating(pos_rating(p));
+            if p as u8 != self.pos { x /= 10; }
+            field_sum += x;
+        }
+
+        let mut fielder = ((cl + cr) * 140) / 200
+            + power * 160 / 100
+            + speed * 50 / 100
+            + field_sum * 50 / 100
+            + throw_ * 40 / 100
+            + catch * 40 / 100
+            + arm * 40 / 100;
+
+        let catcher_fit = pos_rating(1);
+        if catcher_fit != 0 {
+            let catcher_mul = (catcher_fit / 20).clamp(1, 4);
+            let call_bonus = match self.catcher {
+                1 => 1, 2 => 3, 3 => 5, 4 => 8, 5 => 12, 6 => 17, 7 => 23, _ => 0,
+            };
+            fielder += ((arm / 3) * catcher_fit) / 100 + call_bonus * catcher_mul;
+        }
+
+        // 原函式一般先 +3；只有 P+2C/P+2D 的位元組合 0x080（低仰角）不加。
+        if self.batting_style != 1 {
+            fielder += 3;
+        }
+
+        const FIELDER_SPECIALS: &[usize] = &[
+            0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+            0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x34,0x35,0x36,0x37,0x38,0x39,
+            0x3a,0x3c,0x3e,0x3f,0x40,
+        ];
+        for &id in FIELDER_SPECIALS {
+            fielder += special_quarter(id, &self.abil);
+        }
+
+        if self.pos != 0 {
+            return (common + fielder).clamp(0, 999);
+        }
+
+        // calc_pitcher_component (FUN_145ABE8E0)
+        let mut pitcher_base = speed_rating(self.speed as i32);
+        pitcher_base += self.pitch_traits.iter().copied().map(trait_rating).sum::<i32>();
+        pitcher_base += rating(self.stamina as i32) * 50 / 100;
+        pitcher_base += rating(pos_rating(0)) * 30 / 100;
+
+        let mut pitch_scores = Vec::with_capacity(N_BALL);
+        for (slot, b) in self.balls.iter().take(N_BALL).enumerate() {
+            let id = b.id & 0x7f;
+            if id == BALL_EMPTY { continue; }
+
+            let mut score = pitch_power_rating(b.power);
+            if slot == 5 || slot == 11 {
+                score = score * 150 / 100;
+            } else {
+                // FUN_145AF5330(type)==5 就是不使用變化量；現有 ball_dir 的 5 即直球系。
+                if ball_dir(id) != Some(5) {
+                    score += pitch_move_bonus(b.move_);
+                }
+            }
+            score += pitch_control_bonus(b.control);
+
+            if matches!(id, 2 | 7 | 12 | 22 | 27 | 28 | 32 | 36 | 38 | 39) {
+                score += 3;
+            } else if matches!(id, 13 | 16 | 41 | 42 | 43) {
+                score += 5;
+            }
+            pitch_scores.push(score);
+        }
+        pitch_scores.sort_unstable_by(|a, b| b.cmp(a));
+        pitch_scores.truncate(10);
+
+        let mut pitch_total = 0;
+        for (i, &score) in pitch_scores.iter().enumerate() {
+            if score == 0 { continue; }
+            let weight = if i < 3 { 100 } else { (120 - (i as i32) * 10).max(10) };
+            pitch_total += score * weight / 100;
+        }
+        if pitch_total > 300 {
+            pitch_total = 300 + (pitch_total - 300) / 2;
+        }
+
+        let mut pitcher = pitcher_base + pitch_total - 4;
+        const PITCHER_SPECIALS: &[usize] = &[
+            0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20,0x21,0x22,0x23,0x24,0x25,0x26,
+            0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,0x30,0x31,0x32,0x33,0x3b,
+        ];
+        for &id in PITCHER_SPECIALS {
+            pitcher += special_quarter(id, &self.abil);
+        }
+
+        // param_3=0 的二刀流加成路徑。
+        let best_field = self.field.iter().copied().max().unwrap_or(0) as i32;
+        let batting_sum = stat(0) + stat(1) + stat(2);
+        if best_field >= 20 && batting_sum >= 150 {
+            let w = (best_field + batting_sum) / 8;
+            let hybrid = fielder * w / 100 + pitcher * (100 - w / 3) / 100;
+            if hybrid > pitcher {
+                return (common + hybrid).clamp(0, 999);
+            }
+        }
+
+        let overall = common + pitcher + throw_ * 20 / 100 + catch * 20 / 100 + arm * 20 / 100;
+        overall.clamp(0, 999)
     }
 
     pub fn ball_label(&self, slot: usize) -> String {
@@ -1067,105 +1382,21 @@ pub fn clear_rec(p: &Proc, obj: usize, idx: usize) -> bool {
 // 2026-08-28 新版：同一個 static root 分成「部員名單」與「道具」兩條鏈
 // （wrapper 鏈由 PR #1 找到；終點跟 `modeobj + 0x185440` 是同一個位置）。
 
-/// 栄冠 singleton 的靜態位址，**新的在前**。
-///
-/// 2026-08-29 的遊戲更新（exe 632MB → 662MB）只搬動了這個位址，
-/// `+0x70` 以下的整條鏈與 modeobj 內部 offset **全部沒變** ——
-/// 一度誤判成「名單改成 vector、結構全變了」，其實是找錯了物件。
-///
-/// | 版本 | 靜態位址 |
-/// |---|---|
-/// | 2026-08-27 更新後 | `exe+139C5EA0` |
-/// | 更新前 | `exe+13626518` |
-///
-/// 逐一驗證（讀到合法的部員數＋姓名才算數），所以多列幾個不會有副作用。
-pub const KOSHIEN_STATIC_CANDS: [usize; 2] = [0x139C5EA0, 0x13626518];
-/// 相容用：等於候選清單的第一個。
-pub const KOSHIEN_STATIC: usize = KOSHIEN_STATIC_CANDS[0];
+/// 栄冠 singleton 的靜態位址。
+/// 原作者路徑：`[exe + KOSHIEN_STATIC] -> +0x70 = ModeObj`。
+pub const KOSHIEN_STATIC: usize = 0x139C5EA0;
 pub const KOSHIEN_COUNT: usize = 0x185448;
 pub const KOSHIEN_ARRAY: usize = 0x185450;
 
-/// 栄冠 singleton getter 的指令樣式：`mov rax,[rip+disp32]` ＋ `mov rax,[rax+0x70]`。
-///
-/// **為什麼不寫死靜態位址**：程式碼位址與模組內資料位址都會隨版本偏移，而且
-/// 偏移量彼此不一致（2026-08-29 實測三條 AOB 分別是 +0x5A390 / +0x5F65B / +0x62110）。
-/// 靠 getter 指令的 disp32 反算，等於讓遊戲自己告訴我們位址在哪，跨版本自動跟上。
-pub const KOSHIEN_GETTER_AOB: &str = "48 8B 05 ?? ?? ?? ?? 48 8B 40 70";
-
-/// 解析 `mov rax,[rip+disp32]`（7 bytes）指到的絕對位址。
-fn rip_target(p: &Proc, insn: usize) -> Option<usize> {
-    let b = p.read(insn, 7)?;
-    let disp = i32::from_le_bytes([b[3], b[4], b[5], b[6]]) as i64;
-    let t = insn as i64 + 7 + disp;
-    if t <= 0 { None } else { Some(t as usize) }
-}
-
-/// AOB 掃描結果的快取。key ＝ pid（遊戲重開換 pid 就重掃）。
-///
-/// ⚠ **這個快取是必要的，不是最佳化**：掃描要跑過 900MB 的程式碼段，
-/// 而 `koshien_modeobj()` 在 pedit 裡是每幀路徑上的呼叫
-/// （2026-08-01 已經踩過一次「AOB 進每幀路徑 → UI 卡死」）。
-/// 候選清單不需要進入栄冠模式就能建立，所以掃一次就能一直用；
-/// **驗證留到讀取時做**（純讀幾個 qword，很便宜）。
-static KOSHIEN_CAND: std::sync::Mutex<Option<(u32, Vec<usize>)>> =
-    std::sync::Mutex::new(None);
-
-/// 栄冠 singleton 的靜態位址**候選清單**（AOB 每個 pid 只掃一次）。
-///
-/// 舊的寫死位址排在最前面 —— 萬一哪天又能用，就省掉一次掃描。
-pub fn koshien_static_candidates(p: &Proc) -> Vec<usize> {
-    if p.base == 0 {
-        return Vec::new();
-    }
-    let mut g = KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((pid, v)) = g.as_ref() {
-        if *pid == p.pid {
-            return v.clone();
-        }
-    }
-    // 只收落在**主模組**裡的目標。`exec_ranges()` 連 ntdll/kernel32 一起掃，
-    // 那些模組的同樣式指令會解析出 0x7ffe... 之類的位址，全是雜訊。
-    // 遊戲 exe 實測 662MB，這裡放寬到 768MB。
-    const MODULE_SPAN: usize = 0x3000_0000;
-    let in_module = |t: usize| t > p.base && t < p.base + MODULE_SPAN;
-    let mut v: Vec<usize> = KOSHIEN_STATIC_CANDS.iter().map(|o| p.base + o).collect();
-    for insn in find_code_all(p, KOSHIEN_GETTER_AOB) {
-        if !in_module(insn) {
-            continue;
-        }
-        if let Some(t) = rip_target(p, insn) {
-            if in_module(t) && !v.contains(&t) {
-                v.push(t);
-            }
-        }
-    }
-    *g = Some((p.pid, v.clone()));
-    v
-}
-
-/// 清掉 AOB 快取（「重新附加」時呼叫）。
-pub fn koshien_cache_clear() {
-    *KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-/// modeobj 的合理性檢查：部員數要在 1..=512，而且第一位部員讀得出合法姓名。
-///
-/// getter 樣式在程式碼段不只一個命中（實測 2 個），光靠「指標非 0」分不出來 ——
-/// 一定要往下讀到**姓名**才算數。
-fn koshien_modeobj_valid(p: &Proc, m: usize) -> bool {
-    if m < 0x10000 {
-        return false;
-    }
-    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
-    if n == 0 || n > 512 {
-        return false;
-    }
-    let first = p.u64_at(m + KOSHIEN_ARRAY) as usize;
-    if first < 0x10000 {
-        return false;
-    }
-    sane_name(&read_name(p, first))
-}
+// ── 新生招募候選人表
+// Region[n] = modeobj + 0x185F78 + n*0x60
+// +0x08..+0x50 共 10 個 Candidate pointer；Candidate +0x18 = Player Object。
+pub const RECRUIT_REGION_BASE: usize = 0x185F78;
+pub const RECRUIT_REGION_STRIDE: usize = 0x60;
+pub const RECRUIT_CANDIDATE_N: usize = 10;
+pub const RECRUIT_PLAYER_FROM_CANDIDATE: usize = 0x18;
+/// 目前 UI 先以 47 個都道府縣 index（0..46）提供選擇。
+pub const RECRUIT_REGION_N: usize = 49;
 
 /// 栄冠的 mode 物件（`[static] -> +0x70`），道具與練習效果都掛在它底下。
 /// 離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
@@ -1173,26 +1404,11 @@ pub fn koshien_modeobj(p: &Proc) -> usize {
     if p.base == 0 {
         return 0;
     }
-    for st in koshien_static_candidates(p) {
-        let l1 = p.u64_at(st) as usize;
-        if l1 < 0x10000 {
-            continue;
-        }
-        let m = p.u64_at(l1 + 0x70) as usize;
-        if koshien_modeobj_valid(p, m) {
-            return m;
-        }
+    let l1 = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
+    if l1 == 0 {
+        return 0;
     }
-    // 指標鏈失效時，用 `koshien_roster()` 掃描留下的結果 —— 道具數量與
-    // 練習效果提升都掛在 modeobj 上，這樣它們也跟著一起救回來。
-    // ⚠ 這裡**只讀快取、不觸發掃描**（本函式在 pedit 是每幀路徑）。
-    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some((pid, Some(m))) = cached {
-        if pid == p.pid && koshien_modeobj_valid(p, m) {
-            return m;
-        }
-    }
-    0
+    p.u64_at(l1 + 0x70) as usize
 }
 
 // ─────────────────── 栄冠部員名單：vector 特徵掃描（2026-08-29 遊戲更新後改用）
@@ -1202,191 +1418,454 @@ fn plausible_heap(a: usize) -> bool {
     (0x1000_0000..0x2_0000_0000).contains(&a) && a % 8 == 0
 }
 
-/// 這個位址是不是一個合法的**選手物件**（姓名 ＋ 8 項能力 ＋ 球種簽章都要過）。
-fn looks_like_player(p: &Proc, obj: usize) -> bool {
-    if !plausible_heap(obj) {
-        return false;
+/// 讀取指定地區的新生招募候選人。
+/// 回傳 `(candidate_index, Candidate base, Player Object base)`。
+///
+/// Candidate 結構已實機確認：`Player Object = Candidate + 0x18`，
+/// 因此姓名、主守備、野手/投手能力、特殊能力都直接沿用既有 `Player` parser。
+pub fn recruit_candidates(p: &Proc, region: usize) -> Vec<(usize, usize, usize)> {
+    if region >= RECRUIT_REGION_N || p.base == 0 {
+        return Vec::new();
     }
-    let Some(raw) = p.read(obj, PLAYER_READ) else { return false };
-    if !ball_sig_ok(&raw[OFF_BALL..OFF_BALL + 36]) {
-        return false;
-    }
-    if !raw[OFF_STATS..OFF_STATS + 8].iter().all(|&v| (1..=127).contains(&v)) {
-        return false;
-    }
-    sane_name(&name_from(&raw))
-}
 
-/// 栄冠部員名單的上限。實測一隊 30 人，放寬到 64。
-const ROSTER_MAX: usize = 64;
-
-/// 掃描找出栄冠的 `modeobj`（指標鏈失效時的逃生口）。
-///
-/// **判準是零成本的**：部員名單陣列的正前方 8 bytes 就是
-/// `KOSHIEN_COUNT`（部員數 i32），而 `KOSHIEN_ARRAY = KOSHIEN_COUNT + 8`。
-/// 所以只要在同一個 buffer 裡看「這個 i32 是不是等於後面連續合法指標的個數」，
-/// 完全不必額外讀記憶體就能篩掉幾乎所有位置，通過的才去驗選手簽章。
-///
-/// 為什麼要找 modeobj 而不是只找名單：道具數量、練習效果提升天數
-/// 全都掛在 `modeobj + KOSHIEN_ITEMOBJ` 上，拿到 modeobj 等於整組功能一起救回來。
-///
-/// ⚠ 這支要掃全記憶體（實測 30 秒），**絕對不可以放進每幀路徑**。
-pub fn find_koshien_modeobj(p: &Proc) -> Option<usize> {
-    const CHUNK: usize = 64 << 20;
-    for (base, size) in p.writable_ranges() {
-        let mut off = 0usize;
-        while off < size {
-            let want = (size - off).min(CHUNK + ROSTER_MAX * 8 + 16);
-            if let Some(buf) = p.read(base + off, want) {
-                let rd = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) as usize;
-                let mut q = 8usize;
-                while q + 8 <= buf.len() {
-                    let n = u32::from_le_bytes(buf[q - 8..q - 4].try_into().unwrap()) as usize;
-                    q += 8;
-                    if n == 0 || n > ROSTER_MAX || q - 8 + n * 8 > buf.len() {
-                        continue;
-                    }
-                    let start = q - 8;
-                    if !(0..n).all(|i| plausible_heap(rd(start + i * 8))) {
-                        continue;
-                    }
-                    // 只驗前兩格 —— 不是名單的話這裡幾乎一定掛掉
-                    if !(0..n.min(2)).all(|i| looks_like_player(p, rd(start + i * 8))) {
-                        continue;
-                    }
-                    if !(0..n).all(|i| looks_like_player(p, rd(start + i * 8))) {
-                        continue;
-                    }
-                    return Some((base + off + start).wrapping_sub(KOSHIEN_ARRAY));
-                }
-            }
-            off += CHUNK;
+    let read_from_modeobj = |m: usize| -> Vec<(usize, usize, usize)> {
+        if m < 0x10000 {
+            return Vec::new();
         }
-    }
-    None
+        let region_base = m + RECRUIT_REGION_BASE + region * RECRUIT_REGION_STRIDE;
+        let mut out = Vec::new();
+        for i in 0..RECRUIT_CANDIDATE_N {
+            let c = p.u64_at(region_base + (i + 1) * 8) as usize;
+            if c < 0x10000 {
+                continue;
+            }
+            let obj = c + RECRUIT_PLAYER_FROM_CANDIDATE;
+            let name = read_name(p, obj);
+            // 尚未生成的地區會有 Candidate slot，但姓名是遊戲預設的「未初期化」。
+            // 這種不能算真正可招募候選人。
+            if sane_name(&name) && name.trim() != "未初期化" {
+                out.push((i, c, obj));
+            }
+        }
+        out
+    };
+
+    // 新生招募與原作者榮冠 roster 共用同一個固定 ModeObj。
+    // 是否允許讀 Region/Candidate 由 pedit 的 koshien_roster gate 負責。
+    read_from_modeobj(koshien_modeobj(p))
 }
 
-/// 掃描找到的 modeobj 快取，以及「這個 pid 已經掃過了」的記號。
-///
-/// 掃描要 30 秒，**每個 pid 只能掃一次** —— 否則指標鏈壞掉時，
-/// 每次重新整理都會重掃一遍，UI 等於整個卡死。
-static MODEOBJ_SCAN: std::sync::Mutex<Option<(u32, Option<usize>)>> =
+
+/// 只列出目前真正有候選球員名單的地區。
+/// 判定標準不是 pointer 非 0，而是至少一位 Candidate 能解析出合法姓名；
+/// 因此遊戲尚未生成、姓名顯示「未初期化」的地區不會出現在 UI。
+pub fn recruit_available_regions(p: &Proc) -> Vec<usize> {
+    (0..RECRUIT_REGION_N)
+        .filter(|&r| !recruit_candidates(p, r).is_empty())
+        .collect()
+}
+
+// ── 新生候選人：天才 flag
+// 已實機確認：FUN_1465B4FD0 控制 Player Object +0xE3C bit1。
+// 新生生成時原生判定為 FUN_1465AB250(99) < 1，因此預設約 1%。
+pub const OFF_TALENT_FLAGS: usize = 0xE3C;
+pub const TALENT_FLAG_MASK: u32 = 0x0000_0002;
+
+pub fn player_is_talent(p: &Proc, obj: usize) -> bool {
+    p.u32_at(obj + OFF_TALENT_FLAGS) & TALENT_FLAG_MASK != 0
+}
+
+pub fn write_player_talent(p: &Proc, obj: usize, talent: bool) -> bool {
+    let old = p.u32_at(obj + OFF_TALENT_FLAGS);
+    let new = if talent { old | TALENT_FLAG_MASK } else { old & !TALENT_FLAG_MASK };
+    p.write(obj + OFF_TALENT_FLAGS, &new.to_le_bytes())
+}
+
+// ── 新生天才出現機率 runtime patch
+// Ghidra 0x145E2BF37 / exe+0x5E2BF37：83 F8 01 = cmp eax,1。
+// EAX 是 0..99 的亂數，後面 `setl dl`，因此把 imm8 改成 0..100
+// 就能直接得到 0%..100% 的天才出現機率。
+pub const TALENT_RATE_PATCH_RVA: usize = 0x5E2BF37;
+pub const TALENT_RATE_DEFAULT: u8 = 1;
+
+pub fn talent_rate(p: &Proc) -> Option<u8> {
+    let site = p.base + TALENT_RATE_PATCH_RVA;
+    let cur = p.read(site, 3)?;
+    if cur.len() == 3 && cur[0] == 0x83 && cur[1] == 0xF8 && cur[2] <= 100 {
+        Some(cur[2])
+    } else {
+        None
+    }
+}
+
+pub fn set_talent_rate(p: &Proc, rate: u8) -> Result<(), String> {
+    if rate > 100 {
+        return Err("天才出現機率必須介於 0～100".into());
+    }
+    let site = p.base + TALENT_RATE_PATCH_RVA;
+    let cur = p.read(site, 3).ok_or("讀不到天才機率 patch 位址")?;
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+        return Err(format!("天才機率 patch 位址驗證失敗：exe+0x{:X} 不是預期的 cmp eax,imm8", TALENT_RATE_PATCH_RVA));
+    }
+    if cur[2] > 100 {
+        return Err(format!("天才機率目前值異常：{}", cur[2]));
+    }
+    if !p.write_code(site + 2, &[rate]) {
+        return Err("無法寫入天才出現機率".into());
+    }
+    Ok(())
+}
+
+// ── 新生招募成功率 100%：純資料表 patch
+//
+// 2026-09-13 重新逆向確認 FUN_1465C64A0 的實際公式：
+//   chance = base[param_2] + max(item_effect, 0) + bonus
+//   success = random(0..99) < chance
+//
+// base table  : Ghidra VA 0x14B18A3E8 → RVA 0x0B18A3E8
+// bonus table : Ghidra VA 0x14B18A400 → RVA 0x0B18A400
+//
+// 原始 base  = [0, 50, 60, 70, 80, 90]
+// 原始 bonus = [(0,+20), (100,+10), (140,0), (180,-10), (220,-20), (260,-30)]
+//
+// 100% 模式只改：
+//   base[1..=5] → 100（base[0] 的特殊語意尚未確認，因此保持 0，不碰）
+//   bonus 的 0/-10/-20/-30 → +10；原本 +20/+10 保持不變。
+// 這樣有效 tier 的 chance 最低為 100 + max(param_3,0) + 10 >= 110。
+// FUN_1465C64A0 的最高反應第一層門檻是 chance-10，因此最低也有 100，
+// 對 random(0..99) 必定成立：同時保證招募成功與最高反應，不改 executable control flow。
+pub const RECRUIT_RATE_BASE_TABLE_RVA: usize = 0x0B18_A3E8;
+pub const RECRUIT_RATE_BONUS_TABLE_RVA: usize = 0x0B18_A400;
+
+const RECRUIT_RATE_BASE_ORIG: [i32; 6] = [0, 50, 60, 70, 80, 90];
+const RECRUIT_RATE_BONUS_ORIG: [i32; 12] = [
+    0, 20,
+    100, 10,
+    140, 0,
+    180, -10,
+    220, -20,
+    260, -30,
+];
+
+// (RVA, 原始值, 100% 模式值)。只列真正會被修改的 9 個 DWORD。
+const RECRUIT_RATE_DATA_PATCH: [(usize, i32, i32); 9] = [
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x04, 50, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x08, 60, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x0C, 70, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x10, 80, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x14, 90, 100),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x14, 0, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x1C, -10, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x24, -20, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x2C, -30, 10),
+];
+
+// 只記錄「本次修改器 instance 實際成功套用」的 PID。
+// 不會在啟動時掃描或擅自恢復其他工具留下的資料修改。
+static RECRUIT_RATE_DATA_PATCH_PID: std::sync::Mutex<Option<u32>> =
     std::sync::Mutex::new(None);
 
-/// 清掉掃描快取（「重新附加」時呼叫）。
-pub fn roster_cache_clear() {
-    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+fn read_i32_exact(p: &Proc, addr: usize) -> Option<i32> {
+    let b = p.read(addr, 4)?;
+    (b.len() == 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// 指標鏈失效時的逃生口：掃描找 modeobj，結果（含失敗）依 pid 快取。
-pub fn koshien_modeobj_scanned(p: &Proc) -> usize {
-    if p.base == 0 {
-        return 0;
+/// 靜態表通常位於唯讀映射；短暫開寫入權限，寫完立即恢復原 protection。
+/// 若該頁原本可執行，仍使用 PAGE_EXECUTE_READWRITE，避免短暫移除 execute 權限；
+/// 一般 .rdata 則用 PAGE_READWRITE。這是資料寫入，不配置 executable memory，也不改 JMP。
+fn write_static_i32(p: &Proc, addr: usize, value: i32) -> bool {
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READWRITE_LOCAL: u32 = 0x40;
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQueryEx(
+            p.h,
+            addr as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 {
+        return false;
     }
-    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some((pid, r)) = cached {
-        if pid == p.pid {
-            // 物件會搬家，所以用之前先驗一次；失效就重掃
-            if let Some(m) = r {
-                if koshien_modeobj_valid(p, m) {
-                    return m;
-                }
-            } else {
-                return 0;
+    let executable_page = matches!(mbi.Protect & 0xFF, 0x10 | 0x20 | 0x40 | 0x80);
+    let temporary = if executable_page {
+        PAGE_EXECUTE_READWRITE_LOCAL
+    } else {
+        PAGE_READWRITE
+    };
+
+    let mut old = 0u32;
+    unsafe {
+        if VirtualProtectEx(p.h, addr as *mut c_void, 4, temporary, &mut old) == 0 {
+            return false;
+        }
+    }
+
+    let ok = p.write(addr, &value.to_le_bytes());
+    let mut back = 0u32;
+    unsafe {
+        VirtualProtectEx(p.h, addr as *mut c_void, 4, old, &mut back);
+    }
+    ok
+}
+
+/// 啟用前驗證完整兩張 table，避免遊戲更新後 RVA / layout 已變卻仍盲寫。
+fn verify_recruit_rate_original_tables(p: &Proc) -> Result<(), String> {
+    for (i, &want) in RECRUIT_RATE_BASE_ORIG.iter().enumerate() {
+        let addr = p.base + RECRUIT_RATE_BASE_TABLE_RVA + i * 4;
+        let got = read_i32_exact(p, addr)
+            .ok_or_else(|| format!("讀不到招募 base table index {i}"))?;
+        if got != want {
+            return Err(format!(
+                "招募 base table 驗證失敗：index {i} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+
+    for (i, &want) in RECRUIT_RATE_BONUS_ORIG.iter().enumerate() {
+        let addr = p.base + RECRUIT_RATE_BONUS_TABLE_RVA + i * 4;
+        let got = read_i32_exact(p, addr)
+            .ok_or_else(|| format!("讀不到招募 bonus table index {i}"))?;
+        if got != want {
+            return Err(format!(
+                "招募 bonus table 驗證失敗：index {i} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_recruit_rate_patch_entries(p: &Proc, patched: bool) -> Result<(), String> {
+    for &(rva, orig, patched_value) in &RECRUIT_RATE_DATA_PATCH {
+        let want = if patched { patched_value } else { orig };
+        let got = read_i32_exact(p, p.base + rva)
+            .ok_or_else(|| format!("讀不到招募機率資料表 exe+0x{rva:X}"))?;
+        if got != want {
+            return Err(format!(
+                "招募機率資料表狀態不符：exe+0x{rva:X} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn recruit_rate_100_enabled(p: &Proc) -> bool {
+    let g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    matches!(*g, Some(pid) if pid == p.pid)
+        && verify_recruit_rate_patch_entries(p, true).is_ok()
+}
+
+/// 還原本次修改器 instance 自己套用的「招募機率100%」資料表 patch。
+///
+/// 安全原則：
+/// - 沒有本 instance 的 active PID 記錄 → 不動任何資料。
+/// - 還原前必須確認 9 個欄位仍是本修改器寫入的值；若被其他工具改過，拒絕覆蓋。
+/// - 若中途寫入失敗，嘗試把已還原的欄位重新套回 patched 值，避免半套狀態。
+pub fn reset_recruit_rate_patch(p: &Proc) -> Result<bool, String> {
+    let mut g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(pid) if pid == p.pid => {}
+        _ => return Ok(false),
+    }
+
+    verify_recruit_rate_patch_entries(p, true)?;
+
+    let mut restored = 0usize;
+    for &(rva, orig, _) in &RECRUIT_RATE_DATA_PATCH {
+        if !write_static_i32(p, p.base + rva, orig) {
+            // best-effort rollback：把前面已還原的欄位重新設回 patched 值。
+            for &(rrva, _, patched_value) in RECRUIT_RATE_DATA_PATCH[..restored].iter().rev() {
+                let _ = write_static_i32(p, p.base + rrva, patched_value);
             }
+            return Err(format!("還原招募機率資料表失敗：exe+0x{rva:X}"));
         }
+        restored += 1;
     }
-    let r = find_koshien_modeobj(p);
-    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.pid, r));
-    r.unwrap_or(0)
+
+    verify_recruit_rate_patch_entries(p, false)?;
+    *g = None;
+    Ok(true)
 }
 
-/// 栄冠部員名單的 wrapper：`[static] -> +0x60 -> +0x20 -> +0x78 -> +0x08`。
-///
-/// 這條鏈由 PR #1 找到。它的終點其實就是 `modeobj + 0x185440` ——
-/// wrapper `+0x08`／`+0x10` 正好等於 [`KOSHIEN_COUNT`]／[`KOSHIEN_ARRAY`]，
-/// 兩條路徑殊途同歸，留著兩條是因為**不知道下次版本會斷哪一條**。
-///
-/// 每個候選都驗到「部員數合理 ＋ 第一位讀得出合法姓名」才採用。
-fn koshien_roster_wrapper(p: &Proc) -> usize {
-    for root in koshien_static_candidates(p) {
-        let mut o = p.u64_at(root) as usize;
-        if o < 0x10000 {
-            continue;
+pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
+    if !enable {
+        reset_recruit_rate_patch(p)?;
+        return Ok(());
+    }
+
+    let mut g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(pid) = *g {
+        if pid == p.pid {
+            // UI 重複要求 enable 時，不重寫；但仍確認資料沒有被外部改掉。
+            verify_recruit_rate_patch_entries(p, true)?;
+            return Ok(());
         }
-        let mut ok = true;
-        for off in [0x60usize, 0x20, 0x78, 0x08] {
-            o = p.u64_at(o + off) as usize;
-            if o < 0x10000 {
-                ok = false;
+        // 遊戲已換 PID；舊 process 的記憶體已不存在，丟掉舊 instance 記錄。
+        *g = None;
+    }
+
+    // 啟用前驗證完整兩張原始 table，而不是只驗證要改的 8 格。
+    verify_recruit_rate_original_tables(p)?;
+
+    let mut written = 0usize;
+    for &(rva, orig, patched_value) in &RECRUIT_RATE_DATA_PATCH {
+        if !write_static_i32(p, p.base + rva, patched_value) {
+            // best-effort rollback：前面已改的欄位全部恢復原始值。
+            for &(rrva, rorig, _) in RECRUIT_RATE_DATA_PATCH[..written].iter().rev() {
+                let _ = write_static_i32(p, p.base + rrva, rorig);
+            }
+            return Err(format!("寫入招募機率資料表失敗：exe+0x{rva:X}"));
+        }
+        let _ = orig; // 保留 tuple 語意，orig 在 rollback / restore 使用。
+        written += 1;
+    }
+
+    if let Err(e) = verify_recruit_rate_patch_entries(p, true) {
+        // 驗證失敗也回滾，避免留下部分或未知狀態。
+        for &(rva, orig, _) in RECRUIT_RATE_DATA_PATCH.iter().rev() {
+            let _ = write_static_i32(p, p.base + rva, orig);
+        }
+        return Err(e);
+    }
+
+    *g = Some(p.pid);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────── LEGACY / DISABLED
+// 舊的 code-cave 方案保留作為研究與相容性備案，但目前完全不參與 UI / lifecycle。
+// 如未來真的需要重新啟用，先移除 `#[cfg(any())]`，並重新審核該版本遊戲的指令與 xref。
+// 舊方案：exe+0x65C6542 的 `mov edi,99` → JMP cave → mov esi,100 → mov edi,99 → jump back。
+#[cfg(any())]
+mod legacy_recruit_rate_code_cave {
+    use super::*;
+
+    pub const RECRUIT_RATE_PATCH_RVA: usize = 0x65C6542;
+    const RECRUIT_RATE_ORIG: [u8; 5] = [0xBF, 0x63, 0x00, 0x00, 0x00];
+    static RECRUIT_RATE_CAVE: std::sync::Mutex<Option<(u32, usize)>> =
+        std::sync::Mutex::new(None);
+
+    pub fn recruit_rate_100_enabled_legacy(p: &Proc) -> bool {
+        let g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(*g, Some((pid, _)) if pid == p.pid)
+    }
+
+    pub fn reset_recruit_rate_patch_legacy(p: &Proc) -> Result<bool, String> {
+        let site = p.base + RECRUIT_RATE_PATCH_RVA;
+        let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        let cave = match *g {
+            Some((pid, cave)) if pid == p.pid => cave,
+            _ => return Ok(false),
+        };
+
+        if !p.write_code(site, &RECRUIT_RATE_ORIG) {
+            return Err("無法還原招募機率原始指令".into());
+        }
+        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+        *g = None;
+        Ok(true)
+    }
+
+    pub fn set_recruit_rate_100_legacy(p: &Proc, enable: bool) -> Result<(), String> {
+        let site = p.base + RECRUIT_RATE_PATCH_RVA;
+        if !enable {
+            reset_recruit_rate_patch_legacy(p)?;
+            return Ok(());
+        }
+
+        let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*g, Some((pid, _)) if pid == p.pid) {
+            return Ok(());
+        }
+        *g = None;
+
+        let cur = p.read(site, 5).ok_or("讀不到招募機率 patch 位址")?;
+        if cur.as_slice() != RECRUIT_RATE_ORIG {
+            return Err(format!(
+                "招募機率 patch 位址驗證失敗：exe+0x{:X} 不是預期指令",
+                RECRUIT_RATE_PATCH_RVA
+            ));
+        }
+
+        let mut cave = 0usize;
+        for delta in (0x0100_0000usize..=0x7000_0000).step_by(0x0100_0000) {
+            for addr in [p.base.wrapping_add(delta), p.base.wrapping_sub(delta)] {
+                let q = unsafe {
+                    VirtualAllocEx(
+                        p.h,
+                        addr as *mut c_void,
+                        0x1000,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                } as usize;
+                if q != 0 {
+                    let d = q as i128 - (site + 5) as i128;
+                    if d >= i32::MIN as i128 && d <= i32::MAX as i128 {
+                        cave = q;
+                        break;
+                    }
+                    unsafe { VirtualFreeEx(p.h, q as *mut c_void, 0, MEM_RELEASE); }
+                }
+            }
+            if cave != 0 {
                 break;
             }
         }
-        if !ok {
-            continue;
+        if cave == 0 {
+            return Err("無法在招募機率程式碼附近配置 code cave".into());
         }
-        let n = p.u64_at(o + 0x08) as usize;
-        if n == 0 || n > 128 {
-            continue;
+
+        let mut code = vec![0xBE, 0x64, 0, 0, 0, 0xBF, 0x63, 0, 0, 0, 0xE9, 0, 0, 0, 0];
+        let back = (site + 5) as i128 - (cave + code.len()) as i128;
+        if back < i32::MIN as i128 || back > i32::MAX as i128 {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("code cave 回跳距離超出 rel32".into());
         }
-        let first = p.u64_at(o + 0x10) as usize;
-        if first >= 0x10000 && sane_name(&read_name(p, first)) {
-            return o;
+        code[11..15].copy_from_slice(&(back as i32).to_le_bytes());
+        if !p.write(cave, &code) {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("無法寫入招募機率 code cave".into());
         }
+
+        let rel = cave as i128 - (site + 5) as i128;
+        let mut jmp = [0xE9, 0, 0, 0, 0];
+        jmp[1..5].copy_from_slice(&(rel as i32).to_le_bytes());
+        if !p.write_code(site, &jmp) {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("無法啟用招募機率 patch".into());
+        }
+        *g = Some((p.pid, cave));
+        Ok(())
     }
-    0
 }
 
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
 ///
-/// **三層**，一層比一層貴，前一層拿得到就不會走到下一層：
-/// 1. `modeobj + KOSHIEN_ARRAY`
-/// 2. wrapper 鏈（PR #1）
-/// 3. 全記憶體掃描（每個 pid 只掃一次，見 [`koshien_modeobj_scanned`]）
-///
-/// ⚠ **順序是實測決定的，不要調回去。** 2026-08-29 讀完存檔後實測：
-/// wrapper 鏈第 3 跳落到一個非 8 對齊的位址、第 4 跳讀出 `0xFF`，**整條斷掉**；
-/// 同一時刻 `modeobj + KOSHIEN_ARRAY` 正常回傳 30 人。
-/// 兩條路的終點本來是同一個位置（wrapper ＝ `modeobj + 0x185440`），
-/// 但中間那幾層顯然會隨畫面／載入狀態變動，所以走固定 offset 的那條穩定得多。
+/// 只走固定 `ModeObj + KOSHIEN_ARRAY` 路徑。
+/// ModeObj 無效時立即回傳空名單，不做 wrapper 或全記憶體 fallback 掃描。
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
+    // 快速模式判斷：只接受固定 ModeObj 路徑。
+    // ModeObj 無效時立即回傳空名單，絕不因為 reload/啟動/Region 刷新而觸發全記憶體掃描。
     let modeobj = koshien_modeobj(p);
-    if modeobj != 0 {
-        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
-        if n > 0 && n <= 512 {
-            let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
-                .filter(|&o| o != 0)
-                .collect();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    let w = koshien_roster_wrapper(p);
-    if w != 0 {
-        let n = p.u64_at(w + 0x08) as usize;
-        if n > 0 && n <= 128 {
-            let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(w + 0x10 + i * 8) as usize)
-                .filter(|&o| o != 0)
-                .collect();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    // 指標鏈全斷 —— 掃描找 modeobj（每個 pid 只掃一次）
-    let m = koshien_modeobj_scanned(p);
-    if m == 0 {
+    if modeobj == 0 {
         return Vec::new();
     }
-    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
+    let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
     if n == 0 || n > 512 {
         return Vec::new();
     }
     (0..n)
-        .map(|i| p.u64_at(m + KOSHIEN_ARRAY + i * 8) as usize)
+        .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
         .filter(|&o| o != 0)
         .collect()
 }
@@ -1400,11 +1879,10 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
 ///
 /// 任一檢查失敗就整批拒絕，避免 roster chain 尚未切到正確 state 時誤寫其他物件。
 pub fn validated_koshien_roster(p: &Proc) -> Result<Vec<usize>, String> {
-    // ⚠ 原本綁死 wrapper 鏈，改成走 `koshien_roster()` —— 那邊有三層 fallback，
-    //   wrapper 斷掉時還有 modeobj offset 與掃描可用，全隊功能才不會整個消失。
+    // `koshien_roster()` 只走固定 ModeObj 快速路徑；不在榮冠時立即拒絕。
     let list = koshien_roster(p);
     if list.is_empty() {
-        return Err("榮冠球員名單尚未就緒（未在球員列表中，或指標鏈與掃描都找不到）".into());
+        return Err("榮冠球員名單尚未就緒（目前不在榮冠模式，或固定 ModeObj 尚未有效）".into());
     }
     if list.len() > 128 {
         return Err(format!("榮冠球員人數異常：{}", list.len()));
